@@ -1,31 +1,68 @@
-from fastapi import FastAPI
 from fastapi import FastAPI, HTTPException
 from elevenlabs.client import ElevenLabs
 from pydub import AudioSegment
 import tempfile
 import os
-from starlette.responses import FileResponse
+import subprocess
+from google.cloud import storage, secretmanager
+import uuid
+from dotenv import load_dotenv
 
 app = FastAPI()
 
-# Configuration
-ELEVENLABS_API_KEY = 'sk_18899df01808bfbd6a7d51150732740481895233be7b4385'
-VOICE_ID = 'tcO8jJ1XXzdQ4pzViV9c'
 BACKGROUND_SONG = "resources/good_morning_i_love_you_blank.mp3" 
+BACKGROUND_VIDEO_NO_MUSIC = "resources/good_morning_i_love_you_no_music.mp4"
+
+def access_secret(project_id, secret_id, version_id="latest"):
+    """
+    Access the secret with the given name and version from Secret Manager.
+    """
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("UTF-8")
+
+load_dotenv()  # Load environment variables from .env file
+
+# Set up environment
+PROJECT_ID = os.environ.get('GOOGLE_CLOUD_PROJECT')
+
+# Get secrets
+ELEVENLABS_API_KEY = access_secret(PROJECT_ID, 'ELEVENLABS_API_KEY')
+MAIN_VOICE_ID = access_secret(PROJECT_ID, 'MAIN_VOICE_ID')
+GOOD_MORNING_BUCKET_NAME = access_secret(PROJECT_ID, 'GOOD_MORNING_BUCKET_NAME')
+MY_MOTHER_MY_QUEEN_BUCKET_NAME = access_secret(PROJECT_ID, 'MY_MOTHER_MY_QUEEN_BUCKET_NAME')
+
+# Initialize Google Cloud Storage client
+storage_client = storage.Client()
+bucket = storage_client.bucket(GOOD_MORNING_BUCKET_NAME)
+
+def upload_to_gcs(file_path, destination_blob_name=None):
+    """Uploads a file to the bucket."""
+    if destination_blob_name is None:
+        # Generate a unique filename if not provided
+        destination_blob_name = f"videos/{uuid.uuid4()}.mp4"
+    
+    blob = bucket.blob(destination_blob_name)
+    blob.upload_from_filename(file_path)
+
+    # Make the blob publicly readable (optional - only if you want public URLs)
+    blob.make_public()    
+    return blob.public_url
 
 def generate_audio_clips(sender: str, recipient: str):
     client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
     
     hi_recipient = client.text_to_speech.convert(
         text=f"Hi {recipient}",
-        voice_id=VOICE_ID,
+        voice_id=MAIN_VOICE_ID,
         model_id="eleven_multilingual_v2",
         output_format="mp3_44100_128"
     )
 
     sender_loves_recipient = client.text_to_speech.convert(
         text=f"{sender} loves you {recipient}",
-        voice_id=VOICE_ID,
+        voice_id=MAIN_VOICE_ID,
         model_id="eleven_multilingual_v2",
         output_format="mp3_44100_128"
     )
@@ -59,32 +96,69 @@ def mix_audio(background_path: str, overlay1: bytes, overlay2: bytes) -> str:
         
         return output_file.name
 
-@app.post("/goodmorning/music/en-US/{sender}/{recipient}")
+def add_audio_to_video(video_path: str, audio_path: str) -> str:
+    # Create temporary file for output
+    output_video = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    output_video.close()
+    
+    try:
+        # Combine video with audio using ffmpeg
+        subprocess.run([
+            "ffmpeg", "-i", video_path, "-i", audio_path,
+            "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0",
+            "-shortest", output_video.name, "-y"
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        return output_video.name
+        
+    except Exception as e:
+        # Clean up on error
+        if os.path.exists(output_video.name):
+            os.unlink(output_video.name)
+        raise e
+
+@app.post("/goodmorning/video/en-US/{sender}/{recipient}")
 async def create_greeting(
     sender: str,
     recipient: str
 ):
+    temp_files = []  # Track temporary files for cleanup
+
     try:
         # Generate audio clips
         overlay1, overlay2 = generate_audio_clips(sender, recipient)
         
-        # Mix audio
-        output_path = mix_audio(BACKGROUND_SONG, overlay1, overlay2)
-        
-        # Return the file and clean up
-        response = FileResponse(
-            output_path,
-            media_type="audio/mpeg",
-            filename="goodmorning.mp3"
-        )
-        
-        # Schedule cleanup
-        response.background = lambda: os.unlink(output_path)
-        
-        return response
+        # First mix the audio using the existing function
+        mixed_audio_path = mix_audio(BACKGROUND_SONG, overlay1, overlay2)
+        temp_files.append(mixed_audio_path)
+
+        # Add the mixed audio to the video
+        output_video_path = add_audio_to_video(BACKGROUND_VIDEO_NO_MUSIC, mixed_audio_path)
+        temp_files.append(output_video_path)
+
+        #destination_blob_name = f"videos/{sender.lower()}_{recipient.lower()}_{uuid.uuid4()}.mp4"
+        # Generate unique destination blob name
+        file_name = f"{sender[0].lower()}{recipient[0].lower()}{uuid.uuid4()}"
+        destination_blob_name = f"videos/{file_name}.mp4"
+
+        # Upload video to GCS
+        video_url = upload_to_gcs(output_video_path, destination_blob_name)
+
+        return {
+            "status": "success",
+            "message": "Good morning video created successfully",
+            "url": video_url,
+            "fileName": destination_blob_name,
+        }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        # Clean up temporary files
+        for file_path in temp_files:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
 
 @app.get("/")
 def root():

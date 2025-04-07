@@ -1,0 +1,10 @@
+runtime: python
+env: flex
+entrypoint: gunicorn -k uvicorn.workers.UvicornWorker main:app
+# uvicorn main:app --reload --port 5000
+# gunicorn -b :$PORT main:app
+
+
+runtime_config:
+  operating_system: ubuntu22
+  runtime_version: "3.10"
