@@ -1,26 +1,18 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from elevenlabs.client import ElevenLabs
 from pydub import AudioSegment
 import tempfile
 import os
 import subprocess
-from google.cloud import storage, secretmanager
+from google.cloud import storage
 import uuid
+from typing import List
 from dotenv import load_dotenv
 
 app = FastAPI()
 
 BACKGROUND_SONG = "resources/good_morning_i_love_you_blank.mp3" 
 BACKGROUND_VIDEO_NO_MUSIC = "resources/good_morning_i_love_you_no_music.mp4"
-
-def access_secret(project_id, secret_id, version_id="latest"):
-    """
-    Access the secret with the given name and version from Secret Manager.
-    """
-    client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
-    response = client.access_secret_version(request={"name": name})
-    return response.payload.data.decode("UTF-8")
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -159,6 +151,20 @@ async def create_greeting(
         for file_path in temp_files:
             if os.path.exists(file_path):
                 os.unlink(file_path)
+
+# New endpoint to handle multiple image uploads
+@app.post("/upload_images")
+async def upload_multiple_images(images: List[UploadFile] = File(...)):
+    """
+    Endpoint to upload multiple images to Google Cloud Storage.
+    """
+    if len(images) > 10:
+        raise HTTPException(status_code=400, detail="You can upload a maximum of 10 images.")
+    
+    try:
+        return upload_images(images)  # Call the upload_images function from image_uploader.py
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 def root():
