@@ -1,26 +1,22 @@
-from fastapi import FastAPI, HTTPException
-from elevenlabs.client import ElevenLabs
+from manage_secrets import access_secret
+from audio_service import generate_good_moring_clips, generate_my_mother_my_queen_clips
+from fastapi import FastAPI, HTTPException, Request
 from pydub import AudioSegment
 import tempfile
 import os
 import subprocess
-from google.cloud import storage, secretmanager
+from google.cloud import storage
 import uuid
 from dotenv import load_dotenv
+import requests
 
 app = FastAPI()
 
 BACKGROUND_SONG = "resources/good_morning_i_love_you_blank.mp3" 
 BACKGROUND_VIDEO_NO_MUSIC = "resources/good_morning_i_love_you_no_music.mp4"
 
-def access_secret(project_id, secret_id, version_id="latest"):
-    """
-    Access the secret with the given name and version from Secret Manager.
-    """
-    client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
-    response = client.access_secret_version(request={"name": name})
-    return response.payload.data.decode("UTF-8")
+LIGHTX_API_URL = "https://api.lightxeditor.com/external/api/v1/portrait"
+LIGHTX_API_KEY = "99d0f16ad4e045d4a7eef3fb76daa2fa_945863be3a2641b9916b4e26db11641c_andoraitools"  # Replace with your actual API key
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -28,17 +24,14 @@ load_dotenv()  # Load environment variables from .env file
 PROJECT_ID = os.environ.get('GOOGLE_CLOUD_PROJECT')
 
 # Get secrets
-ELEVENLABS_API_KEY = access_secret(PROJECT_ID, 'ELEVENLABS_API_KEY')
-MAIN_VOICE_ID = access_secret(PROJECT_ID, 'MAIN_VOICE_ID')
 GOOD_MORNING_BUCKET_NAME = access_secret(PROJECT_ID, 'GOOD_MORNING_BUCKET_NAME')
 MY_MOTHER_MY_QUEEN_BUCKET_NAME = access_secret(PROJECT_ID, 'MY_MOTHER_MY_QUEEN_BUCKET_NAME')
 
 # Initialize Google Cloud Storage client
 storage_client = storage.Client()
-bucket = storage_client.bucket(GOOD_MORNING_BUCKET_NAME)
 
-def upload_to_gcs(file_path, destination_blob_name=None):
-    """Uploads a file to the bucket."""
+def upload_to_gcs(bucket, file_path, destination_blob_name=None):
+    """Uploads a file to the specified bucket."""
     if destination_blob_name is None:
         # Generate a unique filename if not provided
         destination_blob_name = f"videos/{uuid.uuid4()}.mp4"
@@ -49,25 +42,6 @@ def upload_to_gcs(file_path, destination_blob_name=None):
     # Make the blob publicly readable (optional - only if you want public URLs)
     blob.make_public()    
     return blob.public_url
-
-def generate_audio_clips(sender: str, recipient: str):
-    client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-    
-    hi_recipient = client.text_to_speech.convert(
-        text=f"Hi {recipient}",
-        voice_id=MAIN_VOICE_ID,
-        model_id="eleven_multilingual_v2",
-        output_format="mp3_44100_128"
-    )
-
-    sender_loves_recipient = client.text_to_speech.convert(
-        text=f"{sender} loves you {recipient}",
-        voice_id=MAIN_VOICE_ID,
-        model_id="eleven_multilingual_v2",
-        output_format="mp3_44100_128"
-    )
-    
-    return hi_recipient, sender_loves_recipient
 
 def mix_audio(background_path: str, overlay1: bytes, overlay2: bytes) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_overlay1, \
@@ -123,10 +97,11 @@ async def create_greeting(
     recipient: str
 ):
     temp_files = []  # Track temporary files for cleanup
+    bucket = storage_client.bucket(GOOD_MORNING_BUCKET_NAME)
 
     try:
         # Generate audio clips
-        overlay1, overlay2 = generate_audio_clips(sender, recipient)
+        overlay1, overlay2 = generate_good_moring_clips(sender, recipient)
         
         # First mix the audio using the existing function
         mixed_audio_path = mix_audio(BACKGROUND_SONG, overlay1, overlay2)
@@ -136,13 +111,12 @@ async def create_greeting(
         output_video_path = add_audio_to_video(BACKGROUND_VIDEO_NO_MUSIC, mixed_audio_path)
         temp_files.append(output_video_path)
 
-        #destination_blob_name = f"videos/{sender.lower()}_{recipient.lower()}_{uuid.uuid4()}.mp4"
         # Generate unique destination blob name
         file_name = f"{sender[0].lower()}{recipient[0].lower()}{uuid.uuid4()}"
         destination_blob_name = f"videos/{file_name}.mp4"
 
         # Upload video to GCS
-        video_url = upload_to_gcs(output_video_path, destination_blob_name)
+        video_url = upload_to_gcs(bucket, output_video_path, destination_blob_name)
 
         return {
             "status": "success",
@@ -154,6 +128,44 @@ async def create_greeting(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+    finally:
+        # Clean up temporary files
+        for file_path in temp_files:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+
+@app.post("/motherqueen/audio/en-US/{recipient}")
+async def upload_multiple_images(
+    recipient: str
+):
+    temp_files = []  # Track temporary files for cleanup
+    bucket = storage_client.bucket(MY_MOTHER_MY_QUEEN_BUCKET_NAME)
+
+    try:
+        # Generate audio clips
+        hello_mother, happy_mothers_day = generate_my_mother_my_queen_clips(recipient)
+
+        # Write audio data to temporary files
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_audio1, \
+             tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_audio2:
+            temp_audio1.write(b"".join(hello_mother))
+            temp_audio2.write(b"".join(happy_mothers_day))
+            temp_files.extend([temp_audio1.name, temp_audio2.name])
+
+        # Upload audio files to GCS
+        audio1_blob_name = f"audio/{recipient.lower()}_hello_mother_{uuid.uuid4()}.mp3"
+        audio2_blob_name = f"audio/{recipient.lower()}_happy_mothers_day_{uuid.uuid4()}.mp3"
+        audio1_url = upload_to_gcs(bucket, temp_audio1.name, audio1_blob_name)
+        audio2_url = upload_to_gcs(bucket, temp_audio2.name, audio2_blob_name)
+
+        return {
+            "status": "success",
+            "message": "My Mother My Queen audio resources created successfully",
+            "audio1_url": audio1_url,
+            "audio2_url": audio2_url
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         # Clean up temporary files
         for file_path in temp_files:
