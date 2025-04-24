@@ -1,5 +1,7 @@
 from manage_secrets import access_secret
 from audio_service import generate_good_moring_clips, generate_my_mother_my_queen_clips
+from image_uploader import upload_to_leonardo
+from image_service import request_leonardo_image
 from fastapi import FastAPI, HTTPException, Request
 from pydub import AudioSegment
 import tempfile
@@ -9,6 +11,10 @@ from google.cloud import storage
 import uuid
 from dotenv import load_dotenv
 import requests
+from fastapi.responses import JSONResponse
+import json
+import openai
+import base64
 
 app = FastAPI()
 
@@ -171,6 +177,105 @@ async def upload_multiple_images(
         for file_path in temp_files:
             if os.path.exists(file_path):
                 os.unlink(file_path)
+
+@app.post("/upload/leonardo/image")
+async def upload_leonardo_image(request: Request):
+    try:
+        body = await request.json()
+        image_url = body.get("image_url")
+
+        if not image_url:
+            raise HTTPException(status_code=400, detail="Image URL is required in the payload.")
+
+        result = upload_to_leonardo(image_url)
+
+        if "error" in result:
+            return JSONResponse(status_code=result.get("status_code", 500), content={"error": result["error"]})
+
+        return {
+            "status": "success",
+            "message": "Image uploaded successfully",
+            "image_id": result["image_id"]
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/generate/leonardo/motherQueenImages")
+async def generate_royal_representation(request: Request):
+    try:
+        body = await request.json()
+        image_url = body.get("image_url")
+        mothers_name = body.get("mothers_name")
+        
+        if not image_url or not mothers_name:
+            raise HTTPException(status_code=400, detail="Image URL and Mother's name are required in the payload.")
+        
+        # Upload the image to Leonardo
+        upload_result = upload_to_leonardo(image_url)
+        if "error" in upload_result:
+            return JSONResponse(status_code=upload_result.get("status_code", 500), content={"error": upload_result["error"]})
+        
+        image_id = upload_result["image_id"]
+        
+        disneyPrincessPrompt = (
+            "Create a portrait of a disney character from the photo. Match the complection, hair style and general "
+            "features on the picture to the disney princess. Make the image a full-body portrait, with the character. "
+            "The character should have features and outfits that reflect a royal theme. Style the characters hair, "
+            "makeup and outfits to match the image, and make it trendy."
+        )
+
+        # Request Disney Princess image  
+        disneyPrincessResponse = request_leonardo_image(
+            controlInitImageId="1140b170-2799-4eb7-a4f5-289aa6264132",
+            prompt=disneyPrincessPrompt,
+            initImageId=image_id,
+            initStrength=0.1
+        )
+
+        barbiePrompt = (
+            f"""Create a barbie-styled image of a doll based on the photo, match the complection, hair style and general
+              features on the picture to the doll. The doll should have barbie-style features
+              and be wearing an outfit that reflects the style of the woman in the photo. Please include the name ({mothers_name})
+              at the top, and the job title along the bottom (Best Mom). Style the dolls hair, makeup and outfit to match the image, 
+              and make it trendy and feminine. Include accessories (Baking Tools, Book, Clothes). 
+              Place the accessories neatly inside the box next to the doll. The box should be a vibrant pink with 
+              a clear plastic front."""
+        )
+
+        # Request Disney Princess image  
+        barbieResponse = request_leonardo_image(
+            controlInitImageId="e7b5e086-73e7-4817-b45d-0133f3d5ef35",
+            prompt=barbiePrompt,
+            initImageId=image_id,
+            initStrength=0.1
+        )
+
+        dreamyPrincessPrompt = (
+            "Use the photo to create a confident, stylish mom with a warm, radiant smile takes a portrait outdoors on a sunny day"
+            "Match the complection, hair style and general features on the picture to the confident mom. "
+            "She stands against a softly blurred backdrop of lush greenery and vibrant flowers, bathed in gentle golden sunlight."
+        )
+
+        # Request Disney Princess image  
+        dreamyQueenResponse = request_leonardo_image(
+            controlInitImageId="a92c3978-e6f7-4eff-ac53-9d4ed5090c66",
+            prompt=dreamyPrincessPrompt,
+            initImageId=image_id,
+            initStrength=0.1
+        )
+
+        return {
+            "status": "success",
+            "message": "Image generated successfully",
+            "image_id": image_id,
+            "disney_princess_generation_id": disneyPrincessResponse['sdGenerationJob']['generationId'],
+            "barbie_generation_id": barbieResponse['sdGenerationJob']['generationId'],
+            "dreamy_princess_generation_id": dreamyQueenResponse['sdGenerationJob']['generationId'],
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 def root():
